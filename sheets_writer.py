@@ -1,11 +1,6 @@
 """
 sheets_writer.py — пишет задачи в Google Таблицу "Hermes Inbox".
-Это общий "почтовый ящик" между ТГ-ботом и Hermes (агентом на компе).
-
-Авторизация (на bot-host):
-  GOOGLE_SHEET_ID            - ID таблицы (из URL)
-  GOOGLE_CREDENTIALS_JSON    - JSON сервисного аккаунта (рекомендуется для сервера)
-  ИЛИ GOOGLE_CREDENTIALS_FILE - путь к файлу сервисного аккаунта
+Авторизация на bot-host: GOOGLE_CREDENTIALS_JSON (сервисный аккаунт).
 """
 
 import os
@@ -37,7 +32,7 @@ def _client():
 
 
 def add_inbox_row(raw, task, sheet_id=None, status="new"):
-    """Добавляет строку в лист Inbox. Возвращает True/False."""
+    """Добавляет строку в лист Inbox. status: new | confirm."""
     sheet_id = sheet_id or os.getenv("GOOGLE_SHEET_ID")
     if not sheet_id or not SHEETS_AVAILABLE:
         return False

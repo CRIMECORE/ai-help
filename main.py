@@ -1,39 +1,35 @@
 """
-Obsidian Voice Bot  v2
+Obsidian Voice Bot  v3
 =======================
-Telegram-бот, который:
-  🎤 принимает ГОЛОСОВЫЕ -> расшифровка (Whisper API)
-  💬 отвечает умно (LLM, OpenAI-совместимый)
-  📥 ПИШЕТ ЗАДАЧУ В GOOGLE ТАБЛИЦУ "Hermes Inbox" (общий почтовый ящик с Hermes на компе)
-  🗂 раскладывает по типам: идея / таск / купить / журнал (по ключевому слову)
-  ⏰ ставит напоминания (пишет в таблицу + отвечает)
-  💡 команда "разбери" -> ИИ дописывает уточнения/варианты
+Telegram-бот "почтальон" в Google Таблицу "Hermes Inbox".
+
+Поведение:
+  🎤 Голосовое / 💬 Текст -> расшифровка (Whisper) + умный ответ (LLM)
+  📝 Заметка (идея/таск/купить/журнал) -> сразу пишет в таблицу (status=new)
+  ⚙️ РЕАЛЬНОЕ ДЕЙСТВИЕ (создать папку, запустить, удалить и т.п.,
+     НЕ связанное с заметкой и НЕ просто вопрос) ->
+       бот шлёт подтверждение: "Я понял так: <описание>" + кнопки [Да] [Нет]
+       Да -> пишет в таблицу (status=confirm)
+       Нет -> ничего не пишет, не делает
+  ❓ Просто вопрос -> отвечает, ничего не пишет
 
 Секреты — ТОЛЬКО через переменные окружения (bot-host) или .env (локально).
 
 Переменные:
-  TELEGRAM_BOT_TOKEN        - токен @BotFather (обязательно)
-  OPENAI_API_KEY            - ключ LLM/Whisper (обязательно)
-  OPENAI_BASE_URL           - база API (опц.)
-  CHAT_MODEL                - модель ответов (опц., gpt-4o-mini)
-  WHISPER_MODEL             - модель расшифровки (опц., whisper-1)
-  GOOGLE_SHEET_ID           - ID таблицы Hermes Inbox (обязательно для записи)
-  GOOGLE_CREDENTIALS_JSON   - JSON сервисного аккаунта (для bot-host) ИЛИ
-  GOOGLE_CREDENTIALS_FILE   - путь к файлу сервисного аккаунта
-  NOTES_DIR                 - локальный резерв заметок (опц., ./notes)
-  ALLOWED_USER_ID           - твой Telegram ID (опц., рекомендуется)
+  TELEGRAM_BOT_TOKEN, OPENAI_API_KEY, OPENAI_BASE_URL, CHAT_MODEL, WHISPER_MODEL,
+  GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS_JSON (или GOOGLE_CREDENTIALS_FILE),
+  NOTES_DIR, ALLOWED_USER_ID, APPROVE_CHAT_ID (твой Telegram ID для подтверждений)
 """
 
 import os
 import io
-import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, ContextTypes,
-    CommandHandler, MessageHandler, filters,
+    CommandHandler, MessageHandler, filters, CallbackQueryHandler,
 )
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -51,7 +47,7 @@ CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "whisper-1")
 NOTES_DIR = os.getenv("NOTES_DIR", "./notes")
 ALLOWED_USER_ID = os.getenv("ALLOWED_USER_ID")
-SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+APPROVE_CHAT_ID = os.getenv("APPROVE_CHAT_ID", ALLOWED_USER_ID)
 
 os.makedirs(NOTES_DIR, exist_ok=True)
 
@@ -62,16 +58,11 @@ if not OPENAI_API_KEY:
 
 client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
 
-# Категории задач (по ключевому слову в начале сообщения)
 CATEGORIES = {
-    "идея": "💡 Идея",
-    "идеи": "💡 Идея",
-    "таск": "✅ Задача",
-    "задача": "✅ Задача",
-    "купить": "🛒 Купить",
-    "купи": "🛒 Купить",
-    "журнал": "📔 Журнал",
-    "дневник": "📔 Журнал",
+    "идея": "💡 Идея", "идеи": "💡 Идея",
+    "таск": "✅ Задача", "задача": "✅ Задача",
+    "купить": "🛒 Купить", "купи": "🛒 Купить",
+    "журнал": "📔 Журнал", "дневник": "📔 Журнал",
     "напомни": "⏰ Напоминание",
 }
 
@@ -83,7 +74,6 @@ def allowed(update: Update) -> bool:
 
 
 def save_local_backup(raw, task):
-    """Локальный резерв (если таблица недоступна)."""
     try:
         now = datetime.now()
         fn = now.strftime("%Y-%m-%d") + " " + task[:30].replace("/", "-") + ".md"
@@ -93,11 +83,10 @@ def save_local_backup(raw, task):
         pass
 
 
-def inbox_write(raw, task, category="📝 Заметка"):
-    """Пишет задачу в Google Таблицу + локальный резерв. Возвращает True/False."""
-    full_task = f"{category} | {task}"
-    ok = sheets_writer.add_inbox_row(raw, full_task, sheet_id=SHEET_ID)
-    save_local_backup(raw, full_task)
+def inbox_write(raw, task, category="📝 Заметка", status="new"):
+    full = f"{category} | {task}"
+    ok = sheets_writer.add_inbox_row(raw, full, sheet_id=os.getenv("GOOGLE_SHEET_ID"), status=status)
+    save_local_backup(raw, full)
     return ok
 
 
@@ -112,8 +101,7 @@ def detect_category(text: str):
 def transcribe(audio_bytes: bytes) -> str:
     audio_file = io.BytesIO(audio_bytes)
     audio_file.name = "voice.ogg"
-    result = client.audio.transcriptions.create(model=WHISPER_MODEL, file=audio_file)
-    return result.text.strip()
+    return client.audio.transcriptions.create(model=WHISPER_MODEL, file=audio_file).text.strip()
 
 
 def chat_reply(user_text: str) -> str:
@@ -121,22 +109,45 @@ def chat_reply(user_text: str) -> str:
         model=CHAT_MODEL,
         messages=[
             {"role": "system", "content": (
-                "Ты — голосовой помощник пользователя. Отвечай кратко, по делу, "
-                "на том же языке, что и пользователь.")},
+                "Ты — голосовой помощник. Отвечай кратко, по делу, на том же языке, что и пользователь.")},
             {"role": "user", "content": user_text},
         ],
     )
     return resp.choices[0].message.content.strip()
 
 
-def expand_idea(text: str) -> str:
-    """ИИ дописывает к идее уточнения и варианты."""
+def classify(text: str) -> str:
+    """Возвращает: 'note' | 'question' | 'action'."""
+    low = text.lower().strip()
+    for key in CATEGORIES:
+        if low.startswith(key):
+            return "note"
+    if low.startswith(("запиши", "сохрани", "note:")):
+        return "note"
     resp = client.chat.completions.create(
         model=CHAT_MODEL,
         messages=[
             {"role": "system", "content": (
-                "Пользователь продиктовал идею. Кратко (3-4 пункта) допиши: "
-                "в чём суть, кому полезно, какие риски, с чего начать. На том же языке.")},
+                "Определи тип команды пользователя. Ответь ОДНИМ словом:\n"
+                "NOTE — если это просто заметка/идея/напоминание/то, что надо сохранить в дневник\n"
+                "QUESTION — если это вопрос, на который надо просто ответить\n"
+                "ACTION — если это реальное действие на компьютере (создать/удалить/переименовать папку или файл, "
+                "запустить программу/скрипт, настроить что-то, скачать, и т.п. НЕ связанное с заметкой)\n"
+                "Если сомневаешься — ACTION.")},
+            {"role": "user", "content": text},
+        ],
+    )
+    return resp.choices[0].message.content.strip().lower()
+
+
+def summarize_task(text: str) -> str:
+    """Краткое описание того, что бот понял — для подтверждения."""
+    resp = client.chat.completions.create(
+        model=CHAT_MODEL,
+        messages=[
+            {"role": "system", "content": (
+                "Пользователь дал задачу. Кратко (1-2 предложения) опиши, что ты понял и что сделаешь. "
+                "Без лишних слов, на том же языке.")},
             {"role": "user", "content": text},
         ],
     )
@@ -150,13 +161,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         return
     await update.message.reply_text(
-        "👋 Я бот-почтальон в твою Google Таблицу «Hermes Inbox».\n\n"
-        "• Голосовое — расшифрую и запишу задачу в таблицу.\n"
-        "• Начни с <b>идея</b> / <b>таск</b> / <b>купить</b> / <b>журнал</b> — раскладу по папкам.\n"
-        "• <b>напомни в 20:00 позвонить маме</b> — поставлю напоминание.\n"
-        "• Команда /разбери — ИИ раскроет твою идею.\n"
-        "• Команда /note &lt;текст&gt; — быстрая запись.\n"
-        "Hermes дома увидит таблицу и выполнит задачу.",
+        "👋 Я бот-почтальон в Google Таблицу «Hermes Inbox».\n\n"
+        "• Голосовое/текст — расшифрую.\n"
+        "• Начни с <b>идея/таск/купить/журнал</b> — сохраню заметку.\n"
+        "• Реальное действие (создать папку и т.п.) — спрошу подтверждение 🔘.\n"
+        "• Просто вопрос — отвечу.\n"
+        "Hermes дома выполнит задачи из таблицы.",
         parse_mode="HTML",
     )
 
@@ -169,28 +179,9 @@ async def note_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Напиши после /note то, что сохранить.")
         return
     cat, clean = detect_category(text)
-    label = cat or "📝 Заметка"
-    ok = inbox_write(text, clean, label)
+    ok = inbox_write(text, clean, cat or "📝 Заметка")
     await update.message.reply_text(
-        ("✅ Записал в таблицу: " if ok else "⚠️ Таблица недоступна, сохранил локально: ")
-        + f"{label} | {clean}"
-    )
-
-
-async def expand_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update):
-        return
-    text = " ".join(context.args) or (context.user_data.get("last_text", ""))
-    if not text:
-        await update.message.reply_text("Напиши после /разбери свою идею.")
-        return
-    await update.message.reply_text("💡 Раскрываю идею…")
-    try:
-        out = expand_idea(text)
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
-        return
-    await update.message.reply_text(out)
+        ("✅ Записал: " if ok else "⚠️ Таблица недоступна, локально: ") + f"{cat or '📝 Заметка'} | {clean}")
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -202,14 +193,13 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         text = transcribe(bytes(audio_bytes))
     except Exception as e:
-        log.exception("Ошибка расшифровки")
         await update.message.reply_text(f"❌ Не удалось расшифровать: {e}")
         return
     if not text:
         await update.message.reply_text("🤔 Не услышал речи.")
         return
     context.user_data["last_text"] = text
-    await process_text(update, text, raw=text)
+    await process(update, text, raw=text)
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -217,49 +207,68 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = update.message.text
     context.user_data["last_text"] = text
-    await process_text(update, text, raw=text)
+    await process(update, text, raw=text)
 
 
-async def process_text(update: Update, text: str, raw: str):
-    low = text.lower().strip()
+async def process(update: Update, text: str, raw: str):
+    kind = classify(text)
+    log.info("Классификация: %s | %s", kind, text[:50])
 
-    # Напоминание
-    if low.startswith("напомни"):
-        rest = text[len("напомни"):].strip()
-        ok = inbox_write(raw, rest, "⏰ Напоминание")
-        await update.message.reply_text(
-            ("⏰ Запомнил напоминание: " if ok else "⚠️ Сохранил локально: ") + rest)
-        return
-
-    # Явная просьба записать
-    if low.startswith(("запиши", "сохрани", "note:")):
+    if kind == "note":
         clean = text.split(":", 1)[-1].strip() if ":" in text else text
         clean = clean.replace("запиши", "", 1).replace("сохрани", "", 1).strip()
         cat, body = detect_category(clean)
-        label = cat or "📝 Заметка"
-        ok = inbox_write(raw, body, label)
+        ok = inbox_write(raw, body, cat or "📝 Заметка")
         await update.message.reply_text(
-            ("✅ Записал в таблицу: " if ok else "⚠️ Таблица недоступна, локально: ")
-            + f"{label} | {body}")
+            ("✅ Записал в таблицу: " if ok else "⚠️ Локально: ") + f"{cat or '📝 Заметка'} | {body}")
         return
 
-    # Обычный диалог
-    try:
-        reply = chat_reply(text)
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка ответа: {e}")
+    if kind == "question":
+        try:
+            await update.message.reply_text(chat_reply(text))
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка: {e}")
         return
-    await update.message.reply_text(reply)
+
+    # ACTION — подтверждение
+    try:
+        summary = summarize_task(text)
+    except Exception:
+        summary = text
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Да, сделай", callback_data=f"yes|{raw}"),
+         InlineKeyboardButton("❌ Нет", callback_data="no")],
+    ])
+    await update.message.reply_text(
+        f"🔘 Я понял так:\n<b>{summary}</b>\n\nСделать это?",
+        parse_mode="HTML", reply_markup=keyboard,
+    )
+
+
+async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "no":
+        await query.edit_message_text("❌ Отменено. Ничего не записал.")
+        return
+    if query.data.startswith("yes|"):
+        raw = query.data[4:]
+        ok = inbox_write(raw, raw, "⚙️ Действие", status="confirm")
+        if ok:
+            await query.edit_message_text(
+                "✅ Записал как подтверждённую задачу. Hermes выполнит при включении компа.")
+        else:
+            await query.edit_message_text("⚠️ Таблица недоступна — сохранил локально.")
 
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("note", note_command))
-    app.add_handler(CommandHandler("разбери", expand_command))
+    app.add_handler(CallbackQueryHandler(button))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    log.info("Бот запущен. Таблица: %s", SHEET_ID or "(не задана)")
+    log.info("Бот запущен v3 (с подтверждением).")
     app.run_polling()
 
 
