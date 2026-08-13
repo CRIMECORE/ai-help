@@ -68,9 +68,10 @@ CATEGORIES = {
 
 
 def allowed(update: Update) -> bool:
-    if not ALLOWED_USER_ID:
-        return True
-    return str(update.effective_user.id) == str(ALLOWED_USER_ID)
+    # Диагностика: логируем ID и пускаем всех (пока тестируем)
+    uid = update.effective_user.id if update.effective_user else None
+    log.info("Входящее сообщение от user_id=%s (ALLOWED_USER_ID=%s)", uid, ALLOWED_USER_ID)
+    return True
 
 
 def save_local_backup(raw, task):
