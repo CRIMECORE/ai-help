@@ -1,0 +1,7 @@
+# Секреты и локальные данные — НЕ заливаем на GitHub
+.env
+notes/
+__pycache__/
+*.pyc
+venv/
+.venv/
